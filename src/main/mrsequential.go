@@ -1,4 +1,4 @@
-package main
+package main //声明主包下的程序,每一个主包下的程序都是一个可以独立运行的程序
 
 //
 // simple sequential MapReduce.
@@ -8,14 +8,18 @@ package main
 
 import "fmt"
 import "6.824/mr"
-import "plugin"
+import "plugin" // 动态加载 .so 插件
 import "os"
 import "log"
 import "io/ioutil"
 import "sort"
 
-// for sorting by key.
-type ByKey []mr.KeyValue
+// 定义一个键值对数组，本质是 []mr.KeyValue 的别名/新类型，用于实现 sort.Interface。
+// type KeyValue struct {
+// 	Key   string
+// 	Value string
+// }
+type ByKey []mr.KeyValue 
 
 // for sorting by key.
 func (a ByKey) Len() int           { return len(a) }
@@ -23,6 +27,7 @@ func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 func main() {
+	//命令行参数检查：期望至少 3 个参数（程序本身 + 插件名 + 最少一个输入文件）
 	if len(os.Args) < 3 {
 		fmt.Fprintf(os.Stderr, "Usage: mrsequential xxx.so inputfiles...\n")
 		os.Exit(1)
@@ -31,6 +36,7 @@ func main() {
 	mapf, reducef := loadPlugin(os.Args[1])
 
 	//
+	// pg*.txt 会展开
 	// read each input file,
 	// pass it to Map,
 	// accumulate the intermediate Map output.
@@ -39,7 +45,7 @@ func main() {
 	for _, filename := range os.Args[2:] {
 		file, err := os.Open(filename)
 		if err != nil {
-			log.Fatalf("cannot open %v", filename)
+			log.Fatalf("cannot open %v", filename) // 会调用os.Exit(1)
 		}
 		content, err := ioutil.ReadAll(file)
 		if err != nil {
@@ -55,16 +61,17 @@ func main() {
 	// intermediate data is in one place, intermediate[],
 	// rather than being partitioned into NxM buckets.
 	//
-
+	// 使用前面定义的 ByKey 类型对 intermediate 进行按 key 排序，使相同 key 的项彼此相邻
+	// 便于后续一次性传入 Reduce。
 	sort.Sort(ByKey(intermediate))
 
 	oname := "mr-out-0"
-	ofile, _ := os.Create(oname)
+	ofile, _ := os.Create(oname) // 使用了_忽略错误
 
 	//
 	// call Reduce on each distinct key in intermediate[],
 	// and print the result to mr-out-0.
-	//
+	// 对相同key的value做聚合
 	i := 0
 	for i < len(intermediate) {
 		j := i + 1

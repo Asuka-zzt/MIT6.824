@@ -1,18 +1,9 @@
 package mr
 
-//
-// RPC definitions.
-//
-// remember to capitalize all names.
-//
-
-import "os"
-import "strconv"
-
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
+import (
+	"os"
+	"strconv"
+)
 
 type ExampleArgs struct {
 	X int
@@ -22,13 +13,39 @@ type ExampleReply struct {
 	Y int
 }
 
-// Add your RPC definitions here.
+type WorkerRequest struct {
+	WorkerId string
+	WorkDone int
+}
 
+// condition of job
+type JobCondition int
 
-// Cook up a unique-ish UNIX-domain socket name
-// in /var/tmp, for the coordinator.
-// Can't use the current directory since
-// Athena AFS doesn't support UNIX-domain sockets.
+const (
+	JobWorking = iota
+	JobWaiting
+	JobDone
+)
+
+// type of job
+type JobType int
+
+const (
+	MapJob = iota
+	ReduceJob
+	WaittingJob
+	KillJob
+)
+
+// condition of coordinator
+type Condition int
+
+const (
+	MapPhase = iota
+	ReducePhase
+	AllDone
+)
+
 func coordinatorSock() string {
 	s := "/var/tmp/824-mr-"
 	s += strconv.Itoa(os.Getuid())
