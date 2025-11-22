@@ -8,120 +8,70 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"path/filepath"
 	"sort"
-	"strconv"
 	"time"
 )
 
-// KeyValue
-// Map functions return a slice of KeyValue.
 type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// 排序支持
 type ByKey []KeyValue
 
 func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
-// use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-// Worker
-// main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
-	workerId := os.Getpid()
-	alive := true
-	attempt := 0
+	for {
+		// 1. 请求任务
+		args := GetJobArgs{}
+		reply := Job{}
+		ok := call("Coordinator.DistributeJob", &args, &reply)
 
-	for alive {
-		attempt++
-		fmt.Println(workerId, " >worker ask", attempt)
-
-		job := RequireTask(workerId)
-		fmt.Println(workerId, "worker get job", job)
-		switch job.JobType {
-		case MapJob:
-			{
-				DoMap(mapf, job)
-				fmt.Println("do map", job.JobId)
-				JobIsDone(workerId, job)
-			}
-		case ReduceJob:
-			if job.JobId >= 8 {
-				DoReduce(reducef, job)
-				fmt.Println("do reduce", job.JobId)
-				JobIsDone(2, job)
-			}
-
-		case WaittingJob:
-			fmt.Println("get waiting")
-			time.Sleep(time.Second)
-		case KillJob:
-			{
-				time.Sleep(time.Second)
-				fmt.Println("[Status] :", workerId, "terminated........")
-				alive = false
-			}
+		if !ok {
+			fmt.Println("Coordinator unreachable, exiting.")
+			return
 		}
-		time.Sleep(time.Second)
 
+		// 2. 根据任务类型处理
+		switch reply.JobType {
+		case MapJob:
+			DoMap(mapf, &reply)
+			callDone(MapJob, reply.JobId)
+
+		case ReduceJob:
+			DoReduce(reducef, &reply)
+			callDone(ReduceJob, reply.JobId)
+
+		case WaitingJob:
+			// 没有任务，休息一下再请求
+			time.Sleep(time.Second)
+
+		case KillJob:
+			return
+		}
 	}
-
-	//CallForMap(workerId)
-
 }
 
-func RequireTask(workerId int) *Job {
-	args := ExampleArgs{}
-
-	reply := Job{}
-
-	call("Coordinator.DistributeJob", &args, &reply)
-	fmt.Println("get response", &reply)
-
-	return &reply
-
-}
-
-//
-// send an RPC request to the coordinator, wait for the response.
-// usually returns true.
-// returns false if something goes wrong.
-
-func call(rpcname string, args interface{}, reply interface{}) bool {
-	sockname := coordinatorSock()
-	c, err := rpc.DialHTTP("unix", sockname)
-	if err != nil {
-		log.Fatal("dialing:", err)
-	}
-	defer c.Close()
-
-	// 服务类的方法名 请求参数 返回值
-	err = c.Call(rpcname, args, reply)
-	if err == nil {
-		return true
-	}
-	fmt.Println(err)
-	return false
-}
-
-func JobIsDone(workerId int, job *Job) {
-	args := job
-	reply := &ExampleReply{}
+func callDone(typ JobType, id int) {
+	args := JobDoneArgs{JobType: typ, JobId: id}
+	reply := JobDoneReply{}
 	call("Coordinator.JobIsDone", &args, &reply)
 }
 
-func DoMap(mapf func(string, string) []KeyValue, response *Job) {
-	var intermediate []KeyValue
-	filename := response.InputFile[0]
-
+func DoMap(mapf func(string, string) []KeyValue, job *Job) {
+	// 读取输入文件
+	filename := job.InputFile[0]
 	file, err := os.Open(filename)
 	if err != nil {
 		log.Fatalf("cannot open %v", filename)
@@ -131,37 +81,63 @@ func DoMap(mapf func(string, string) []KeyValue, response *Job) {
 		log.Fatalf("cannot read %v", filename)
 	}
 	file.Close()
-	intermediate = mapf(filename, string(content))
 
-	//initialize and loop over []KeyValue
-	rn := response.ReducerNum
-	HashedKV := make([][]KeyValue, rn)
+	// 执行 Map 函数
+	kva := mapf(filename, string(content))
 
-	for _, kv := range intermediate {
-		HashedKV[ihash(kv.Key)%rn] = append(HashedKV[ihash(kv.Key)%rn], kv)
+	// 准备中间文件 Buffer (二维切片)
+	buckets := make([][]KeyValue, job.ReducerNum)
+	for _, kv := range kva {
+		bucketId := ihash(kv.Key) % job.ReducerNum
+		buckets[bucketId] = append(buckets[bucketId], kv)
 	}
-	for i := 0; i < rn; i++ {
-		oname := "mr-tmp-" + strconv.Itoa(response.JobId) + "-" + strconv.Itoa(i)
-		ofile, _ := os.Create(oname)
-		enc := json.NewEncoder(ofile)
-		for _, kv := range HashedKV[i] {
+
+	// 写入磁盘
+	for i := 0; i < job.ReducerNum; i++ {
+		// 临时文件格式: mr-MapID-ReduceID
+		oname := fmt.Sprintf("mr-%d-%d", job.JobId, i)
+		// 先写临时文件
+		tempFile, _ := ioutil.TempFile("", "mr-map-tmp-*")
+		enc := json.NewEncoder(tempFile)
+		for _, kv := range buckets[i] {
 			enc.Encode(kv)
 		}
-		ofile.Close()
+		tempFile.Close()
+		// 原子重命名
+		os.Rename(tempFile.Name(), oname)
 	}
-
 }
 
-func DoReduce(reducef func(string, []string) string, response *Job) {
-	reduceFileNum := response.JobId
-	intermediate := readFromLocalFile(response.InputFile)
-	sort.Sort(ByKey(intermediate))
-	dir, _ := os.Getwd()
-	//tempFile, err := ioutil.TempFile(dir, "mr-tmp-*")
-	tempFile, err := ioutil.TempFile(dir, "mr-tmp-*")
+func DoReduce(reducef func(string, []string) string, job *Job) {
+	// 读取所有相关的中间文件: mr-*-ReduceID
+	// 使用 Glob 模式匹配
+	pattern := fmt.Sprintf("mr-*-%d", job.JobId)
+	matches, err := filepath.Glob(pattern)
 	if err != nil {
-		log.Fatal("Failed to create temp file", err)
+		log.Fatalf("Reduce Glob error: %v", err)
 	}
+
+	var intermediate []KeyValue
+	for _, filename := range matches {
+		file, _ := os.Open(filename)
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+		file.Close()
+	}
+
+	sort.Sort(ByKey(intermediate))
+
+	// 创建最终输出文件 mr-out-ReduceID
+	oname := fmt.Sprintf("mr-out-%d", job.JobId)
+	tempFile, _ := ioutil.TempFile("", "mr-out-tmp-*")
+
+	// 执行 Reduce
 	i := 0
 	for i < len(intermediate) {
 		j := i + 1
@@ -173,27 +149,29 @@ func DoReduce(reducef func(string, []string) string, response *Job) {
 			values = append(values, intermediate[k].Value)
 		}
 		output := reducef(intermediate[i].Key, values)
+
+		// 格式化输出
 		fmt.Fprintf(tempFile, "%v %v\n", intermediate[i].Key, output)
 		i = j
 	}
 	tempFile.Close()
-	oname := fmt.Sprintf("mr-out-%d", reduceFileNum)
 	os.Rename(tempFile.Name(), oname)
 }
 
-func readFromLocalFile(files []string) []KeyValue {
-	var kva []KeyValue
-	for _, filepath := range files {
-		file, _ := os.Open(filepath)
-		dec := json.NewDecoder(file)
-		for {
-			var kv KeyValue
-			if err := dec.Decode(&kv); err != nil {
-				break
-			}
-			kva = append(kva, kv)
-		}
-		file.Close()
+func call(rpcname string, args interface{}, reply interface{}) bool {
+	sockname := coordinatorSock()
+	c, err := rpc.DialHTTP("unix", sockname)
+	if err != nil {
+		log.Println("dialing:", err)
+		return false
 	}
-	return kva
+	defer c.Close()
+
+	err = c.Call(rpcname, args, reply)
+	if err == nil {
+		return true
+	}
+
+	fmt.Println(err)
+	return false
 }
